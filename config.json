@@ -1,6 +1,8 @@
 {
   "site_url": "https://vvbmilis-bit.github.io/digest/",
   "send_to_telegram": true,
+  "ai_summary": true,
+  "model": "gemini-2.5-flash",
   "news_per_block": 5,
   "kz_feeds": [
     "https://tengrinews.kz/news.rss"
