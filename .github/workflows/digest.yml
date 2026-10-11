@@ -1,0 +1,19 @@
+name: Daily digest
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC = 08:00 в Казахстане (UTC+5)
+  workflow_dispatch:       # кнопка ручного запуска
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python digest.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
