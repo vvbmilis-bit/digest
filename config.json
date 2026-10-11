@@ -1,0 +1,21 @@
+{
+  "site_url": "https://vvbmilis-bit.github.io/digest/",
+  "send_to_telegram": true,
+  "news_per_block": 5,
+  "kz_feeds": [
+    "https://tengrinews.kz/news.rss"
+  ],
+  "ai_feeds": [
+    "https://habr.com/ru/rss/hub/artificial_intelligence/all/",
+    "https://techcrunch.com/category/artificial-intelligence/feed/"
+  ],
+  "finance_words": [
+    "закон", "кодекс", "налог", "ндс", "финанс", "тенге", "нацбанк",
+    "национальный банк", "банк", "кредит", "ипотек", "пенси", "пособи",
+    "выплат", "штраф", "бюджет", "депозит", "инфляц", "тариф"
+  ],
+  "border_words": [
+    "границ", "пограничн", "въезд", "выезд", "безвиз", "визов", "визы",
+    "визу", "кпп", "таможн", "миграци", "пересечен"
+  ]
+}
