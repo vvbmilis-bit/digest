@@ -22,6 +22,11 @@ MONTHS = ["января", "февраля", "марта", "апреля", "ма�
 DATE_STR = f"{NOW.day} {MONTHS[NOW.month - 1]} {NOW.year}"
 CODES = ("USD", "RUB", "CNY")
 
+def get_json(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
 # ---------- Курсы и история ----------
 def get_rates_for(day):
     url = f"https://nationalbank.kz/rss/get_rates.cfm?fdate={day:%d.%m.%Y}"
@@ -84,6 +89,89 @@ def sparkline(values):
             'stroke-width="2" vector-effect="non-scaling-stroke" '
             'stroke-linejoin="round" stroke-linecap="round"/></svg>')
 
+# ---------- Погода (Open-Meteo, без ключа) ----------
+def weather_desc(code):
+    if code == 0:
+        return "☀️", "Ясно"
+    if code == 1:
+        return "🌤️", "Преимущественно ясно"
+    if code == 2:
+        return "⛅", "Переменная облачность"
+    if code == 3:
+        return "☁️", "Пасмурно"
+    if code in (45, 48):
+        return "🌫️", "Туман"
+    if code in (51, 53, 55, 56, 57):
+        return "🌦️", "Морось"
+    if code in (61, 63, 65, 66, 67, 80, 81, 82):
+        return "🌧️", "Дождь"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "🌨️", "Снег"
+    if code in (95, 96, 99):
+        return "⛈️", "Гроза"
+    return "🌡️", "Погода"
+
+def get_weather():
+    w = CFG.get("weather")
+    if not w:
+        return None
+    url = ("https://api.open-meteo.com/v1/forecast?"
+           f"latitude={w['lat']}&longitude={w['lon']}"
+           "&current=temperature_2m,weather_code"
+           "&daily=temperature_2m_max,temperature_2m_min,"
+           "precipitation_probability_max,wind_speed_10m_max,weather_code"
+           "&timezone=auto&forecast_days=1")
+    try:
+        d = get_json(url)
+        daily = d["daily"]
+        return {
+            "name": w.get("name", ""),
+            "now": float(d["current"]["temperature_2m"]),
+            "code": int(daily["weather_code"][0]),
+            "tmax": float(daily["temperature_2m_max"][0]),
+            "tmin": float(daily["temperature_2m_min"][0]),
+            "rain": float(daily["precipitation_probability_max"][0] or 0),
+            "wind": float(daily["wind_speed_10m_max"][0] or 0),
+        }
+    except Exception as e:
+        print(f"[!] Погода недоступна: {e}")
+        return None
+
+# ---------- Криптовалюты (CoinGecko, без ключа) ----------
+def fmt_price(p):
+    if p >= 1000:
+        return f"{p:,.0f}".replace(",", " ")
+    if p >= 1:
+        return f"{p:.2f}"
+    return f"{p:.4f}"
+
+def get_crypto():
+    ids = CFG.get("crypto_ids", [])
+    if not ids:
+        return []
+    url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
+           f"&ids={','.join(ids)}&sparkline=true&price_change_percentage=24h,7d")
+    try:
+        data = get_json(url)
+    except Exception as e:
+        print(f"[!] Криптовалюты недоступны: {e}")
+        return []
+    order = {c: i for i, c in enumerate(ids)}
+    data.sort(key=lambda x: order.get(x.get("id"), 99))
+    out = []
+    for c in data:
+        if c.get("current_price") is None:
+            continue
+        spark = ((c.get("sparkline_in_7d") or {}).get("price") or [])[::4]
+        out.append({
+            "symbol": (c.get("symbol") or "").upper(),
+            "price": float(c["current_price"]),
+            "ch24": c.get("price_change_percentage_24h_in_currency"),
+            "ch7": c.get("price_change_percentage_7d_in_currency"),
+            "spark": spark,
+        })
+    return out
+
 # ---------- Telegram-каналы (публичные, через t.me/s/) ----------
 def read_tg_channel(name, limit, max_age_days):
     req = urllib.request.Request(
@@ -132,8 +220,14 @@ def read_tg_channels(cfg):
             print(f"[!] Канал {name}: {e}")
     return items
 
-# ---------- Пересказ через ИИ (Google Gemini, бесплатный уровень) ----------
-def summarize(tg, hist):
+# ---------- Пересказ и урок через ИИ (Google Gemini, бесплатный уровень) ----------
+def lesson_topic():
+    topics = CFG.get("lesson_topics") or []
+    if not topics or not CFG.get("show_lesson", True):
+        return None
+    return topics[NOW.timetuple().tm_yday % len(topics)]
+
+def summarize(tg, hist, weather, crypto, topic):
     key = os.environ.get("GEMINI_API_KEY")
     if not key or not CFG.get("ai_summary", True):
         return {}
@@ -146,18 +240,36 @@ def summarize(tg, hist):
         parts.append("Курсы к тенге (первый день периода -> последний):")
         for c in CODES:
             parts.append(f"{c}: {hist[0][1][c]:.2f} -> {hist[-1][1][c]:.2f}")
+    if weather:
+        _, desc = weather_desc(weather["code"])
+        parts.append(
+            f"Погода сегодня ({weather['name']}): сейчас {weather['now']:+.0f}°, "
+            f"днём от {weather['tmin']:+.0f}° до {weather['tmax']:+.0f}°, {desc}, "
+            f"вероятность осадков до {weather['rain']:.0f}%")
+    if crypto:
+        parts.append("Криптовалюты, изменение за 24 часа: " + ", ".join(
+            f"{c['symbol']} {c['ch24']:+.1f}%" for c in crypto
+            if c.get("ch24") is not None))
+    if topic:
+        parts.append(f"Тема ИИ-урока дня: {topic}")
     if not parts:
         return {}
     prompt = (
         "Ты помощник, который пишет утренний дайджест на русском языке. "
-        "Ниже посты из Telegram-каналов (каждый с номером) и динамика курсов к тенге. "
-        "Для каждого поста напиши одно короткое предложение по сути (поле items, "
-        "ключ это номер поста). Поле tg: 1-2 предложения о главном по постам. "
-        "Поле overview: 2-3 предложения о главном за утро, можно упомянуть "
-        "изменение курсов. Опирайся ТОЛЬКО на присланный текст, ничего не "
-        "выдумывай и не добавляй цифр или деталей, которых там нет. "
+        "Ниже данные: посты из Telegram-каналов (с номерами), курсы, погода, "
+        "криптовалюты и тема урока. "
+        "Поле items: для каждого поста одно короткое предложение по сути, ключ это "
+        "номер поста. Поле tg: 1-2 предложения о главном по постам. "
+        "Поле overview: 2-3 предложения о главном за утро, можно упомянуть курсы, "
+        "погоду и криптовалюты. По данным выше опирайся ТОЛЬКО на присланный текст "
+        "и цифры, ничего не выдумывай. "
+        "Поле lesson: объект с полями title (заголовок) и text (4-6 предложений) "
+        "про указанную тему ИИ-урока: объясни простыми словами для новичка. "
+        "Без заданий, без упражнений, без советов что попрактиковать и без "
+        "упоминания ИИ-агентов. Если не уверен в факте, не пиши его, цифры и "
+        "названия не выдумывай. Если темы урока нет, пропусти поле lesson. "
         'Ответь только JSON вида {"overview": "...", "tg": "...", '
-        '"items": {"1": "...", "2": "..."}}.'
+        '"items": {"1": "..."}, "lesson": {"title": "...", "text": "..."}}.'
         "\n\n" + "\n".join(parts)
     )
     model = CFG.get("model", "gemini-3.8-flash")
@@ -245,6 +357,17 @@ def overview_card(text):
         return ""
     return card("✨ Главное за утро", f'<div class="sum">{html.escape(text)}</div>')
 
+def weather_card(w):
+    if not w:
+        return ""
+    icon, desc = weather_desc(w["code"])
+    rows = (f'<div class="row"><span>{icon} {desc}</span><b>{w["now"]:+.0f}°</b></div>'
+            f'<div class="row"><span>Сегодня</span>'
+            f'<span>{w["tmin"]:+.0f}° … {w["tmax"]:+.0f}°</span></div>'
+            f'<div class="row muted"><span>Осадки до {w["rain"]:.0f}%</span>'
+            f'<span>Ветер до {w["wind"]:.0f} км/ч</span></div>')
+    return card(f'🌤️ Погода · {html.escape(w["name"])}', rows)
+
 def rates_card(hist):
     title = "💱 Курсы к тенге"
     if not hist:
@@ -276,6 +399,23 @@ def rates_card(hist):
         rows += f'<div class="note">График и изменение за {days} дн.</div>'
     return card(title, rows)
 
+def crypto_card(crypto):
+    if not crypto:
+        return ""
+    rows = ""
+    for c in crypto:
+        sub = []
+        for label, key in (("24ч", "ch24"), ("7д", "ch7")):
+            ch = c.get(key)
+            if ch is not None:
+                sub.append(f'<span class="{arrow_class(ch)}">{label} {arrow(ch)}</span>')
+        rows += (f'<div class="row"><span class="nm">🪙 {html.escape(c["symbol"])}</span>'
+                 f'<span class="spark">{sparkline(c["spark"])}</span>'
+                 f'<span class="val"><b>${fmt_price(c["price"])}</b>'
+                 f'<small>{" · ".join(sub)}</small></span></div>')
+    rows += '<div class="note">Цены в долларах США, график за 7 дней</div>'
+    return card("🪙 Криптовалюты", rows)
+
 def tg_card(tg, sums):
     rows = ""
     if sums.get("tg"):
@@ -292,11 +432,36 @@ def tg_card(tg, sums):
                      f'🎁 @{html.escape(p["channel"])}: {text}</a></div>')
     return card("📣 Telegram и подарки", rows)
 
-def build_page(hist, tg, sums):
+def lesson_card(sums):
+    lesson = sums.get("lesson")
+    if not lesson:
+        return ""
+    if isinstance(lesson, dict):
+        title = str(lesson.get("title", "")).strip()
+        text = str(lesson.get("text", "")).strip()
+    else:
+        title, text = "", str(lesson).strip()
+    if not text:
+        return ""
+    head = f"<b>{html.escape(title)}</b><br>" if title else ""
+    return card("🧠 ИИ-урок дня", f'<div class="sum">{head}{html.escape(text)}</div>')
+
+def reminders_card():
+    items = [str(x) for x in CFG.get("reminders", []) if str(x).strip()]
+    if not items:
+        return ""
+    rows = "".join(f'<div class="row">📌 {html.escape(x)}</div>' for x in items)
+    return card("📌 Мои напоминания", rows)
+
+def build_page(hist, weather, crypto, tg, sums):
     body = "".join([
         overview_card(sums.get("overview", "")),
+        weather_card(weather),
         rates_card(hist),
+        crypto_card(crypto),
         tg_card(tg, sums),
+        lesson_card(sums),
+        reminders_card(),
     ])
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -306,16 +471,21 @@ def build_page(hist, tg, sums):
 <style>{CSS}</style></head>
 <body><div class="wrap">
 <div><div class="kicker">📅 Ежедневный дайджест</div><h1>{DATE_STR}</h1>
-<div class="sub">Курсы валют и посты из Telegram. Обновляется каждое утро.</div></div>
+<div class="sub">Погода, курсы, крипта и посты из Telegram. Обновляется каждое утро.</div></div>
 {body}
 <div class="foot">☀️ Собрано автоматически</div>
 </div></body></html>"""
 
 # ---------- Telegram: короткое сообщение со ссылкой ----------
-def telegram_text(hist, sums):
+def telegram_text(hist, weather, crypto, sums):
     lines = [f"📅 <b>Дайджест · {DATE_STR}</b>", ""]
     if sums.get("overview"):
         lines.append("✨ " + html.escape(sums["overview"]))
+        lines.append("")
+    if weather:
+        icon, desc = weather_desc(weather["code"])
+        lines.append(f"{icon} <b>{html.escape(weather['name'])}</b>: "
+                     f"{weather['tmin']:+.0f}…{weather['tmax']:+.0f}°, {desc.lower()}")
         lines.append("")
     if hist:
         last = hist[-1][1]
@@ -326,6 +496,13 @@ def telegram_text(hist, sums):
             parts.append(f"{flag} {last[code]:.2f} ₸{tail}")
         lines.append("💱 <b>Курсы к тенге</b>")
         lines.append(" · ".join(parts))
+        lines.append("")
+    if crypto:
+        lines.append("🪙 <b>Крипта</b>")
+        lines.append(" · ".join(
+            f"{c['symbol']} ${fmt_price(c['price'])}"
+            + (f" {arrow(c['ch24'])}" if c.get("ch24") is not None else "")
+            for c in crypto))
         lines.append("")
     url = html.escape(CFG["site_url"], quote=True)
     lines.append(f'🌐 <a href="{url}">Открыть дайджест на сайте</a>')
@@ -352,13 +529,16 @@ if __name__ == "__main__":
     hist = get_history(int(CFG.get("history_days", 14)))
     if not hist:
         print("[!] Курсы Нацбанка недоступны")
+    weather = get_weather()
+    crypto = get_crypto()
     tg = read_tg_channels(CFG)
-    sums = summarize(tg, hist)
+    topic = lesson_topic()
+    sums = summarize(tg, hist, weather, crypto, topic)
 
     os.makedirs("site", exist_ok=True)
     with open("site/index.html", "w", encoding="utf-8") as f:
-        f.write(build_page(hist, tg, sums))
+        f.write(build_page(hist, weather, crypto, tg, sums))
     print("Страница сохранена: site/index.html")
 
     if CFG.get("send_to_telegram", True):
-        send_telegram(telegram_text(hist, sums))
+        send_telegram(telegram_text(hist, weather, crypto, sums))
