@@ -84,6 +84,56 @@ def kazakhstan(cfg):
     general = [it for it in items if it["link"] not in used][:n]
     return finance, border, general
 
+# ---------- Пересказ через ИИ (Google Gemini, бесплатный уровень) ----------
+def summarize(blocks):
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key or not CFG.get("ai_summary", True):
+        return {}
+    lines = []
+    for name, items in blocks.items():
+        if items:
+            lines.append(f"[{name}]")
+            lines += [f"- {it['title']}" for it in items]
+    if not lines:
+        return {}
+    prompt = (
+        "Ты помощник, который пишет утренний дайджест на русском языке. "
+        "Ниже заголовки новостей по блокам: finance (законы и финансы), "
+        "border (границы и въезд), kz (Казахстан), ai (искусственный интеллект). "
+        "Для каждого блока напиши 1-2 коротких предложения: о чём главное. "
+        "Опирайся ТОЛЬКО на заголовки, ничего не выдумывай и не добавляй цифр "
+        "или деталей, которых в них нет. Блоки без новостей пропусти. "
+        "Поле overview: 2-3 предложения о главном за утро. "
+        'Ответь только JSON вида {"overview": "...", "finance": "...", '
+        '"border": "...", "kz": "...", "ai": "..."}.'
+        "\n\n" + "\n".join(lines)
+    )
+    model = CFG.get("model", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"x-goog-api-key": key,
+                 "Content-Type": "application/json",
+                 "User-Agent": "digest-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts).strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+        result = json.loads(text)
+        print("Пересказ от ИИ получен")
+        return result
+    except urllib.error.HTTPError as e:
+        print("[!] Ошибка ИИ:", e.read().decode()[:300])
+    except Exception as e:
+        print("[!] Ошибка ИИ:", e)
+    return {}
+
 # ---------- Страница сайта ----------
 CSS = """
 *{box-sizing:border-box}
@@ -94,6 +144,7 @@ h1{margin:6px 0 0;font-size:32px;line-height:1.15}
 .sub{font-size:15px;color:#8d97ad;margin-top:6px}
 .card{background:#151c2c;border-radius:16px;padding:6px 18px 8px}
 .h{margin:0;padding:14px 0 6px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#8d97ad;font-weight:600}
+.sum{padding:2px 0 12px;font-size:15px;line-height:1.5;color:#c5cce0}
 .row{display:flex;justify-content:space-between;align-items:center;gap:12px;min-height:44px;padding:8px 0;border-top:1px solid #232c42;font-size:16px;line-height:1.35}
 .muted{color:#8d97ad}
 a{color:#e8ecf5;text-decoration:none}a:hover{color:#4fd1c5}
@@ -102,6 +153,11 @@ a{color:#e8ecf5;text-decoration:none}a:hover{color:#4fd1c5}
 
 def card(title, rows):
     return f'<div class="card"><h2 class="h">{title}</h2>{rows}</div>'
+
+def overview_card(text):
+    if not text:
+        return ""
+    return card("✨ Главное за утро", f'<div class="sum">{html.escape(text)}</div>')
 
 def rates_card(r):
     title = "💱 Курсы к тенге"
@@ -119,24 +175,27 @@ def rates_card(r):
              f'<span>{rub_per_usd:.2f} ₽ · {cny_per_usd:.2f} ¥</span></div>')
     return card(title, rows)
 
-def news_card(title, icon, items):
+def news_card(title, icon, items, summary=""):
+    rows = ""
+    if summary:
+        rows += f'<div class="sum">{html.escape(summary)}</div>'
     if not items:
-        rows = '<div class="row muted">Свежих новостей по теме пока нет</div>'
+        rows += '<div class="row muted">Свежих новостей по теме пока нет</div>'
     else:
-        rows = ""
         for it in items:
             link = html.escape(it["link"], quote=True)
             text = html.escape(it["title"])
             rows += f'<div class="row"><a href="{link}">{icon} {text}</a></div>'
     return card(title, rows)
 
-def build_page(rates, finance, border, general, ai):
+def build_page(rates, finance, border, general, ai, sums):
     body = "".join([
+        overview_card(sums.get("overview", "")),
         rates_card(rates),
-        news_card("⚖️ Законы и финансы", "💰", finance),
-        news_card("🛂 Границы и въезд", "🛃", border),
-        news_card("🇰🇿 Казахстан", "📰", general),
-        news_card("🤖 Искусственный интеллект", "✨", ai),
+        news_card("⚖️ Законы и финансы", "💰", finance, sums.get("finance", "")),
+        news_card("🛂 Границы и въезд", "🛃", border, sums.get("border", "")),
+        news_card("🇰🇿 Казахстан", "📰", general, sums.get("kz", "")),
+        news_card("🤖 Искусственный интеллект", "✨", ai, sums.get("ai", "")),
     ])
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -151,8 +210,11 @@ def build_page(rates, finance, border, general, ai):
 </div></body></html>"""
 
 # ---------- Telegram: короткое сообщение со ссылкой ----------
-def telegram_text(rates):
+def telegram_text(rates, sums):
     lines = [f"📅 <b>Дайджест · {DATE_STR}</b>", ""]
+    if sums.get("overview"):
+        lines.append("✨ " + html.escape(sums["overview"]))
+        lines.append("")
     if rates:
         usd, rub, cny = rates["USD"], rates["RUB"], rates["CNY"]
         lines.append("💱 <b>Курсы к тенге</b>")
@@ -190,11 +252,12 @@ if __name__ == "__main__":
 
     finance, border, general = kazakhstan(CFG)
     ai = read_many(CFG["ai_feeds"], CFG["news_per_block"])
+    sums = summarize({"finance": finance, "border": border, "kz": general, "ai": ai})
 
     os.makedirs("site", exist_ok=True)
     with open("site/index.html", "w", encoding="utf-8") as f:
-        f.write(build_page(rates, finance, border, general, ai))
+        f.write(build_page(rates, finance, border, general, ai, sums))
     print("Страница сохранена: site/index.html")
 
     if CFG.get("send_to_telegram", True):
-        send_telegram(telegram_text(rates))
+        send_telegram(telegram_text(rates, sums))
