@@ -1,3 +1,4 @@
+import time
 import html
 import json
 import os
@@ -119,20 +120,19 @@ def summarize(blocks):
         headers={"x-goog-api-key": key,
                  "Content-Type": "application/json",
                  "User-Agent": "digest-bot"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = json.load(r)
-        parts = data["candidates"][0]["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts).strip()
-        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
-        result = json.loads(text)
-        print("Пересказ от ИИ получен")
-        return result
-    except urllib.error.HTTPError as e:
-        print("[!] Ошибка ИИ:", e.read().decode()[:300])
-    except Exception as e:
-        print("[!] Ошибка ИИ:", e)
-    return {}
+        try:
+        data = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    data = json.load(r)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 503) and attempt < 3:
+                    print(f"[!] ИИ занят (код {e.code}), повтор через {20 * (attempt + 1)} с")
+                    time.sleep(20 * (attempt + 1))
+                    continue
+                raise
 
 # ---------- Страница сайта ----------
 CSS = """
