@@ -1,8 +1,8 @@
-import time
 import html
 import json
 import os
 import re
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -109,7 +109,7 @@ def summarize(blocks):
         '"border": "...", "kz": "...", "ai": "..."}.'
         "\n\n" + "\n".join(lines)
     )
-    model = CFG.get("model", "gemini-2.5-flash")
+    model = CFG.get("model", "gemini-3.8-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -120,19 +120,35 @@ def summarize(blocks):
         headers={"x-goog-api-key": key,
                  "Content-Type": "application/json",
                  "User-Agent": "digest-bot"})
+
+    data = None
+    for attempt in range(4):
         try:
-        data = None
-        for attempt in range(4):
-            try:
-                with urllib.request.urlopen(req, timeout=60) as r:
-                    data = json.load(r)
-                break
-            except urllib.error.HTTPError as e:
-                if e.code in (429, 500, 503) and attempt < 3:
-                    print(f"[!] ИИ занят (код {e.code}), повтор через {20 * (attempt + 1)} с")
-                    time.sleep(20 * (attempt + 1))
-                    continue
-                raise
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 503) and attempt < 3:
+                wait = 20 * (attempt + 1)
+                print(f"[!] ИИ занят (код {e.code}), повтор через {wait} с")
+                time.sleep(wait)
+                continue
+            print("[!] Ошибка ИИ:", e.read().decode()[:300])
+            return {}
+        except Exception as e:
+            print("[!] Ошибка ИИ:", e)
+            return {}
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts).strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
+        result = json.loads(text)
+        print("Пересказ от ИИ получен")
+        return result
+    except Exception as e:
+        print("[!] Ошибка ИИ (разбор ответа):", e)
+        return {}
 
 # ---------- Страница сайта ----------
 CSS = """
