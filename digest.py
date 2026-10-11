@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -19,95 +20,145 @@ NOW = datetime.now(timezone(timedelta(hours=5)))  # время Казахста�
 MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
           "августа", "сентября", "октября", "ноября", "декабря"]
 DATE_STR = f"{NOW.day} {MONTHS[NOW.month - 1]} {NOW.year}"
+CODES = ("USD", "RUB", "CNY")
 
-# ---------- Курсы ----------
-def get_rates():
-    url = f"https://nationalbank.kz/rss/get_rates.cfm?fdate={NOW:%d.%m.%Y}"
-    with urllib.request.urlopen(url, timeout=15) as r:
-        root = ET.fromstring(r.read())
+# ---------- Курсы и история ----------
+def get_rates_for(day):
+    url = f"https://nationalbank.kz/rss/get_rates.cfm?fdate={day:%d.%m.%Y}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            root = ET.fromstring(r.read())
+    except Exception:
+        return None
     result = {}
     for item in root.iter("item"):
         code = item.findtext("title")
-        if code in ("USD", "RUB", "CNY"):
-            rate = float(item.findtext("description"))
-            quant = float(item.findtext("quant") or 1)
-            result[code] = rate / quant  # тенге за 1 единицу
-    return result
-
-# ---------- Новости ----------
-def read_feed(url, limit):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        root = ET.fromstring(r.read())
-    items = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        items.append({
-            "title": title,
-            "link": (item.findtext("link") or "").strip(),
-            "text": (title + " " + (item.findtext("description") or "")).lower(),
-        })
-        if len(items) >= limit:
-            break
-    return items
-
-def read_many(urls, limit):
-    items = []
-    for url in urls:
-        try:
-            items += read_feed(url, limit)
-        except Exception as e:
-            print(f"[!] Не удалось прочитать {url}: {e}")
-    return items
-
-def matches(text, words):
-    return any(re.search(r"\b" + w, text) for w in words)
-
-def kazakhstan(cfg):
-    items = read_many(cfg["kz_feeds"], 60)
-    n = cfg["news_per_block"]
-    used = set()
-
-    def pick(words):
-        out = []
-        for it in items:
-            if it["link"] in used:
+        if code in CODES:
+            try:
+                rate = float(item.findtext("description"))
+                quant = float(item.findtext("quant") or 1)
+            except (TypeError, ValueError):
                 continue
-            if matches(it["text"], words):
-                out.append(it)
-                used.add(it["link"])
-            if len(out) >= n:
-                break
-        return out
+            result[code] = rate / quant  # тенге за 1 единицу
+    return result if len(result) == len(CODES) else None
 
-    finance = pick(cfg["finance_words"])
-    border = pick(cfg["border_words"])
-    general = [it for it in items if it["link"] not in used][:n]
-    return finance, border, general
+def get_history(days):
+    """Список (дата, курсы) от старых дней к новым. Дни без данных пропускаются."""
+    dates = [NOW.date() - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        results = list(ex.map(get_rates_for, dates))
+    return [(d, r) for d, r in zip(dates, results) if r]
+
+def change_pct(values):
+    if len(values) < 2 or not values[0]:
+        return None
+    return (values[-1] - values[0]) / values[0] * 100
+
+def arrow(ch):
+    if ch is None:
+        return ""
+    if abs(ch) < 0.05:
+        return f"▬ {abs(ch):.1f}%"
+    return ("▲" if ch > 0 else "▼") + f" {abs(ch):.1f}%"
+
+def arrow_class(ch):
+    if ch is None or abs(ch) < 0.05:
+        return "flat"
+    return "up" if ch > 0 else "down"
+
+def sparkline(values):
+    if len(values) < 2:
+        return ""
+    lo, hi = min(values), max(values)
+    n = len(values) - 1
+
+    def y(v):
+        if hi == lo:
+            return 14
+        return 26 - (v - lo) / (hi - lo) * 24
+
+    pts = " ".join(f"{i / n * 100:.1f},{y(v):.1f}" for i, v in enumerate(values))
+    return ('<svg viewBox="0 0 100 28" preserveAspectRatio="none" width="100%" '
+            'height="28" aria-hidden="true">'
+            f'<polyline points="{pts}" fill="none" stroke="var(--accent)" '
+            'stroke-width="2" vector-effect="non-scaling-stroke" '
+            'stroke-linejoin="round" stroke-linecap="round"/></svg>')
+
+# ---------- Telegram-каналы (публичные, через t.me/s/) ----------
+def read_tg_channel(name, limit, max_age_days):
+    req = urllib.request.Request(
+        f"https://t.me/s/{name}", headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        page = r.read().decode("utf-8", errors="replace")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    text_limit = CFG.get("tg_text_limit", 4000)
+    posts = []
+    for chunk in page.split("tgme_widget_message_wrap")[1:]:
+        m_text = re.search(r"tgme_widget_message_text[^>]*>(.*?)</div>", chunk, re.S)
+        m_link = re.search(
+            r'href="(https://t\.me/' + re.escape(name) + r'/\d+)"', chunk, re.I
+        )
+        if not m_text or not m_link:
+            continue
+        m_time = re.search(r'<time[^>]*datetime="([^"]+)"', chunk)
+        if m_time:
+            try:
+                if datetime.fromisoformat(m_time.group(1)) < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        text = re.sub(r"<br\s*/?>", " ", m_text.group(1))
+        text = re.sub(r"<[^>]+>", "", text)
+        text = " ".join(html.unescape(text).split())
+        if not text:
+            continue
+        short = text if len(text) <= 160 else text[:157].rstrip() + "…"
+        posts.append({"channel": name, "title": short,
+                      "full": text[:text_limit], "link": m_link.group(1)})
+    return posts[-limit:][::-1]  # сначала самые новые
+
+def read_tg_channels(cfg):
+    items = []
+    for name in cfg.get("tg_channels", []):
+        try:
+            posts = read_tg_channel(name, cfg.get("tg_posts", 3),
+                                    cfg.get("tg_max_age_days", 3))
+            if not posts:
+                print(f"[!] Канал {name}: свежих постов не найдено "
+                      f"(возможно, веб-просмотр отключён)")
+            items += posts
+        except Exception as e:
+            print(f"[!] Канал {name}: {e}")
+    return items
 
 # ---------- Пересказ через ИИ (Google Gemini, бесплатный уровень) ----------
-def summarize(blocks):
+def summarize(tg, hist):
     key = os.environ.get("GEMINI_API_KEY")
     if not key or not CFG.get("ai_summary", True):
         return {}
-    lines = []
-    for name, items in blocks.items():
-        if items:
-            lines.append(f"[{name}]")
-            lines += [f"- {it['title']}" for it in items]
-    if not lines:
+    parts = []
+    if tg:
+        parts.append("Посты из Telegram-каналов (с номерами):")
+        for i, p in enumerate(tg, 1):
+            parts.append(f"[{i}] @{p['channel']}: {p['full']}")
+    if len(hist) >= 2:
+        parts.append("Курсы к тенге (первый день периода -> последний):")
+        for c in CODES:
+            parts.append(f"{c}: {hist[0][1][c]:.2f} -> {hist[-1][1][c]:.2f}")
+    if not parts:
         return {}
     prompt = (
         "Ты помощник, который пишет утренний дайджест на русском языке. "
-        "Ниже заголовки новостей по блокам: finance (законы и финансы), "
-        "border (границы и въезд), kz (Казахстан), ai (искусственный интеллект). "
-        "Для каждого блока напиши 1-2 коротких предложения: о чём главное. "
-        "Опирайся ТОЛЬКО на заголовки, ничего не выдумывай и не добавляй цифр "
-        "или деталей, которых в них нет. Блоки без новостей пропусти. "
-        "Поле overview: 2-3 предложения о главном за утро. "
-        'Ответь только JSON вида {"overview": "...", "finance": "...", '
-        '"border": "...", "kz": "...", "ai": "..."}.'
-        "\n\n" + "\n".join(lines)
+        "Ниже посты из Telegram-каналов (каждый с номером) и динамика курсов к тенге. "
+        "Для каждого поста напиши одно короткое предложение по сути (поле items, "
+        "ключ это номер поста). Поле tg: 1-2 предложения о главном по постам. "
+        "Поле overview: 2-3 предложения о главном за утро, можно упомянуть "
+        "изменение курсов. Опирайся ТОЛЬКО на присланный текст, ничего не "
+        "выдумывай и не добавляй цифр или деталей, которых там нет. "
+        'Ответь только JSON вида {"overview": "...", "tg": "...", '
+        '"items": {"1": "...", "2": "..."}}.'
+        "\n\n" + "\n".join(parts)
     )
     model = CFG.get("model", "gemini-3.8-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -145,8 +196,8 @@ def summarize(blocks):
             return {}
 
     try:
-        parts = data["candidates"][0]["content"]["parts"]
-        text = "".join(p.get("text", "") for p in parts).strip()
+        resp_parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in resp_parts).strip()
         text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
         result = json.loads(text)
         print("Пересказ от ИИ получен")
@@ -155,21 +206,35 @@ def summarize(blocks):
         print("[!] Ошибка ИИ (разбор ответа):", e)
         return {}
 
+def item_summaries(sums):
+    items = sums.get("items")
+    if isinstance(items, list):
+        items = {str(i + 1): v for i, v in enumerate(items)}
+    return items if isinstance(items, dict) else {}
+
 # ---------- Страница сайта ----------
 CSS = """
+:root{--bg:#0d1220;--card:#151c2c;--text:#e8ecf5;--muted:#8d97ad;--line:#232c42;--accent:#4fd1c5;--sum:#c5cce0;--up:#5ad19a;--down:#ff7a7a}
+@media (prefers-color-scheme: light){:root{--bg:#f4f6fb;--card:#ffffff;--text:#16203a;--muted:#5d6785;--line:#e3e8f2;--accent:#0b7a72;--sum:#34405e;--up:#17803d;--down:#c0392b}}
 *{box-sizing:border-box}
-body{margin:0;background:#0d1220;color:#e8ecf5;font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
+body{margin:0;background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
 .wrap{max-width:720px;margin:0 auto;padding:28px 16px 40px;display:flex;flex-direction:column;gap:16px}
-.kicker{font-size:13px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;color:#4fd1c5}
+.kicker{font-size:13px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;color:var(--accent)}
 h1{margin:6px 0 0;font-size:32px;line-height:1.15}
-.sub{font-size:15px;color:#8d97ad;margin-top:6px}
-.card{background:#151c2c;border-radius:16px;padding:6px 18px 8px}
-.h{margin:0;padding:14px 0 6px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#8d97ad;font-weight:600}
-.sum{padding:2px 0 12px;font-size:15px;line-height:1.5;color:#c5cce0}
-.row{display:flex;justify-content:space-between;align-items:center;gap:12px;min-height:44px;padding:8px 0;border-top:1px solid #232c42;font-size:16px;line-height:1.35}
-.muted{color:#8d97ad}
-a{color:#e8ecf5;text-decoration:none}a:hover{color:#4fd1c5}
-.foot{text-align:center;font-size:13px;color:#8d97ad;padding-top:6px}
+.sub{font-size:15px;color:var(--muted);margin-top:6px}
+.card{background:var(--card);border-radius:16px;padding:6px 18px 8px}
+.h{margin:0;padding:14px 0 6px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.sum{padding:2px 0 12px;font-size:15px;line-height:1.5;color:var(--sum)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;min-height:44px;padding:8px 0;border-top:1px solid var(--line);font-size:16px;line-height:1.35}
+.nm{flex:0 0 auto}
+.spark{flex:1;min-width:56px;max-width:140px}
+.val{display:flex;flex-direction:column;align-items:flex-end;text-align:right}
+.val small{font-size:13px;color:var(--muted)}
+.up{color:var(--up)}.down{color:var(--down)}.flat{color:var(--muted)}
+.muted{color:var(--muted)}
+.note{font-size:12px;color:var(--muted);padding:8px 0 4px;border-top:1px solid var(--line)}
+a{color:var(--text);text-decoration:none}a:hover{color:var(--accent)}
+.foot{text-align:center;font-size:13px;color:var(--muted);padding-top:6px}
 """
 
 def card(title, rows):
@@ -180,66 +245,87 @@ def overview_card(text):
         return ""
     return card("✨ Главное за утро", f'<div class="sum">{html.escape(text)}</div>')
 
-def rates_card(r):
+def rates_card(hist):
     title = "💱 Курсы к тенге"
-    if not r:
+    if not hist:
         return card(title, '<div class="row muted">Недоступны</div>')
-    usd = r["USD"]
-    rows = f'<div class="row"><span>🇺🇸 Доллар</span><b>{usd:.2f} ₸</b></div>'
-    for code, flag, name in (("RUB", "🇷🇺", "Рубль"), ("CNY", "🇨🇳", "Юань")):
-        kzt = r[code]
-        rows += (f'<div class="row"><span>{flag} {name}</span><span><b>{kzt:.2f} ₸</b> '
-                 f'<span class="muted">· {kzt / usd:.4f} $</span></span></div>')
-    rub_per_usd = usd / r["RUB"]
-    cny_per_usd = usd / r["CNY"]
-    rows += (f'<div class="row muted"><span>💵 За 1 $</span>'
-             f'<span>{rub_per_usd:.2f} ₽ · {cny_per_usd:.2f} ¥</span></div>')
-    return card(title, rows)
-
-def news_card(title, icon, items, summary=""):
+    rate_date, last = hist[-1]
+    series = {c: [r[c] for _, r in hist] for c in CODES}
+    usd = last["USD"]
     rows = ""
-    if summary:
-        rows += f'<div class="sum">{html.escape(summary)}</div>'
-    if not items:
-        rows += '<div class="row muted">Свежих новостей по теме пока нет</div>'
-    else:
-        for it in items:
-            link = html.escape(it["link"], quote=True)
-            text = html.escape(it["title"])
-            rows += f'<div class="row"><a href="{link}">{icon} {text}</a></div>'
+    if rate_date != NOW.date():
+        rows += (f'<div class="sum muted">Последние данные Нацбанка: '
+                 f'{rate_date:%d.%m.%Y}</div>')
+    for code, flag, name in (("USD", "🇺🇸", "Доллар"), ("RUB", "🇷🇺", "Рубль"),
+                             ("CNY", "🇨🇳", "Юань")):
+        kzt = last[code]
+        ch = change_pct(series[code])
+        sub = []
+        if code != "USD":
+            sub.append(f"{kzt / usd:.4f} $")
+        if ch is not None:
+            sub.append(f'<span class="{arrow_class(ch)}">{arrow(ch)}</span>')
+        rows += (f'<div class="row"><span class="nm">{flag} {name}</span>'
+                 f'<span class="spark">{sparkline(series[code])}</span>'
+                 f'<span class="val"><b>{kzt:.2f} ₸</b>'
+                 f'<small>{" · ".join(sub)}</small></span></div>')
+    rows += (f'<div class="row muted"><span>💵 За 1 $</span>'
+             f'<span>{usd / last["RUB"]:.2f} ₽ · {usd / last["CNY"]:.2f} ¥</span></div>')
+    if len(hist) >= 2:
+        days = max((hist[-1][0] - hist[0][0]).days, 1)
+        rows += f'<div class="note">График и изменение за {days} дн.</div>'
     return card(title, rows)
 
-def build_page(rates, finance, border, general, ai, sums):
+def tg_card(tg, sums):
+    rows = ""
+    if sums.get("tg"):
+        rows += f'<div class="sum">{html.escape(sums["tg"])}</div>'
+    if not tg:
+        rows += ('<div class="row muted">Свежих постов нет '
+                 '(проверь tg_channels в config.json)</div>')
+    else:
+        items = item_summaries(sums)
+        for i, p in enumerate(tg, 1):
+            link = html.escape(p["link"], quote=True)
+            text = html.escape(str(items.get(str(i)) or p["title"]))
+            rows += (f'<div class="row"><a href="{link}">'
+                     f'🎁 @{html.escape(p["channel"])}: {text}</a></div>')
+    return card("📣 Telegram и подарки", rows)
+
+def build_page(hist, tg, sums):
     body = "".join([
         overview_card(sums.get("overview", "")),
-        rates_card(rates),
-        news_card("⚖️ Законы и финансы", "💰", finance, sums.get("finance", "")),
-        news_card("🛂 Границы и въезд", "🛃", border, sums.get("border", "")),
-        news_card("🇰🇿 Казахстан", "📰", general, sums.get("kz", "")),
-        news_card("🤖 Искусственный интеллект", "✨", ai, sums.get("ai", "")),
+        rates_card(hist),
+        tg_card(tg, sums),
     ])
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>Дайджест · {DATE_STR}</title>
 <style>{CSS}</style></head>
 <body><div class="wrap">
 <div><div class="kicker">📅 Ежедневный дайджест</div><h1>{DATE_STR}</h1>
-<div class="sub">Курсы, Казахстан и ИИ. Обновляется каждое утро.</div></div>
+<div class="sub">Курсы валют и посты из Telegram. Обновляется каждое утро.</div></div>
 {body}
 <div class="foot">☀️ Собрано автоматически</div>
 </div></body></html>"""
 
 # ---------- Telegram: короткое сообщение со ссылкой ----------
-def telegram_text(rates, sums):
+def telegram_text(hist, sums):
     lines = [f"📅 <b>Дайджест · {DATE_STR}</b>", ""]
     if sums.get("overview"):
         lines.append("✨ " + html.escape(sums["overview"]))
         lines.append("")
-    if rates:
-        usd, rub, cny = rates["USD"], rates["RUB"], rates["CNY"]
+    if hist:
+        last = hist[-1][1]
+        parts = []
+        for code, flag in (("USD", "🇺🇸"), ("RUB", "🇷🇺"), ("CNY", "🇨🇳")):
+            ch = change_pct([r[code] for _, r in hist])
+            tail = f" {arrow(ch)}" if ch is not None else ""
+            parts.append(f"{flag} {last[code]:.2f} ₸{tail}")
         lines.append("💱 <b>Курсы к тенге</b>")
-        lines.append(f"🇺🇸 {usd:.2f} ₸ · 🇷🇺 {rub:.2f} ₸ · 🇨🇳 {cny:.2f} ₸")
+        lines.append(" · ".join(parts))
         lines.append("")
     url = html.escape(CFG["site_url"], quote=True)
     lines.append(f'🌐 <a href="{url}">Открыть дайджест на сайте</a>')
@@ -263,22 +349,16 @@ def send_telegram(text):
         print("Ошибка Telegram:", e.read().decode())
 
 if __name__ == "__main__":
-    rates = None
-    try:
-        rates = get_rates()
-        if not all(c in rates for c in ("USD", "RUB", "CNY")):
-            rates = None
-    except Exception as e:
-        print(f"[!] Курсы недоступны: {e}")
-
-    finance, border, general = kazakhstan(CFG)
-    ai = read_many(CFG["ai_feeds"], CFG["news_per_block"])
-    sums = summarize({"finance": finance, "border": border, "kz": general, "ai": ai})
+    hist = get_history(int(CFG.get("history_days", 14)))
+    if not hist:
+        print("[!] Курсы Нацбанка недоступны")
+    tg = read_tg_channels(CFG)
+    sums = summarize(tg, hist)
 
     os.makedirs("site", exist_ok=True)
     with open("site/index.html", "w", encoding="utf-8") as f:
-        f.write(build_page(rates, finance, border, general, ai, sums))
+        f.write(build_page(hist, tg, sums))
     print("Страница сохранена: site/index.html")
 
     if CFG.get("send_to_telegram", True):
-        send_telegram(telegram_text(rates, sums))
+        send_telegram(telegram_text(hist, sums))
