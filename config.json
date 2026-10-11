@@ -32,7 +32,7 @@
     "theway_of_hero",
     "tengrinews"
   ],
-  "tg_posts": 3,
-  "tg_max_age_days": 3,
+  "tg_posts": 2,
+  "tg_max_age_days": 2,
   "tg_text_limit": 4000
 }
