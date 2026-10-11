@@ -124,7 +124,7 @@ def summarize(blocks):
     data = None
     for attempt in range(4):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.load(r)
             break
         except urllib.error.HTTPError as e:
@@ -136,6 +136,11 @@ def summarize(blocks):
             print("[!] Ошибка ИИ:", e.read().decode()[:300])
             return {}
         except Exception as e:
+            if attempt < 3:
+                wait = 20 * (attempt + 1)
+                print(f"[!] ИИ не ответил ({e}), повтор через {wait} с")
+                time.sleep(wait)
+                continue
             print("[!] Ошибка ИИ:", e)
             return {}
 
