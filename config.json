@@ -3,21 +3,16 @@
   "send_to_telegram": true,
   "ai_summary": true,
   "model": "gemini-3.8-flash",
-  "news_per_block": 5,
-  "kz_feeds": [
-    "https://tengrinews.kz/news.rss"
+  "history_days": 14,
+  "tg_channels": [
+    "crypta",
+    "dashi_agent",
+    "zicelaqo",
+    "AntiFomoChannel",
+    "theway_of_hero",
+    "tengrinews"
   ],
-  "ai_feeds": [
-    "https://habr.com/ru/rss/hub/artificial_intelligence/all/",
-    "https://techcrunch.com/category/artificial-intelligence/feed/"
-  ],
-  "finance_words": [
-    "закон", "кодекс", "налог", "ндс", "финанс", "тенге", "нацбанк",
-    "национальный банк", "банк", "кредит", "ипотек", "пенси", "пособи",
-    "выплат", "штраф", "бюджет", "депозит", "инфляц", "тариф"
-  ],
-  "border_words": [
-    "границ", "пограничн", "въезд", "выезд", "безвиз", "визов", "визы",
-    "визу", "кпп", "таможн", "миграци", "пересечен"
-  ]
+  "tg_posts": 3,
+  "tg_max_age_days": 3,
+  "tg_text_limit": 4000
 }
